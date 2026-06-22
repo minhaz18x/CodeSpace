@@ -45,6 +45,16 @@ ui_warn()   { echo -e "${C_BLUE}│ ${C_YELLOW}⚠  $1${C_RST}"; }
 ui_end()    { echo -e "${C_BLUE}╰────────────────────────────────────────${C_RST}"; }
 ui_err()    { echo -e "\n${C_RED} [✖] FATAL: $1${C_RST}" >&2; exit 1; }
 
+build_repo_url() {
+    local repo_short=$1
+    local proto=$2
+    if [ "$proto" == "2" ]; then
+        echo "git@github.com:${repo_short}.git"
+    else
+        echo "https://github.com/${repo_short}.git"
+    fi
+}
+
 # ==============================================================================
 # WORKFLOW MODULES
 # ==============================================================================
@@ -52,14 +62,21 @@ ui_err()    { echo -e "\n${C_RED} [✖] FATAL: $1${C_RST}" >&2; exit 1; }
 probe_push_config() {
     ui_header "TRANSMISSION CONFIGURATION"
     
-    local def_ssh="git@github.com:pa-xe/android_kernel_xiaomi_miatoll.git"
+    local def_repo="pa-xe/android_kernel_xiaomi_miatoll"
     local def_branch="lineage-22.2"
     local def_base="upstream/lineage-20"
 
-    echo -e "${C_BLUE}│${C_RST} ${C_DIM}Press [ENTER] to use defaults.${C_RST}"
+    echo -e "${C_BLUE}│${C_RST} ${C_DIM}Select Protocol:${C_RST}"
+    echo -e "${C_BLUE}│${C_RST}  ${C_CYAN}[1]${C_RST} HTTPS"
+    echo -e "${C_BLUE}│${C_RST}  ${C_CYAN}[2]${C_RST} SSH"
+    read -r -p "${C_BLUE}│${C_RST} Choice [1/2]: " PROTO_CHOICE
+    PROTO_CHOICE="${PROTO_CHOICE:-2}" # Default to SSH for pushes
+
+    echo -e "${C_BLUE}│${C_RST} ${C_DIM}Press [ENTER] to use defaults. Use 'User/Repo' format.${C_RST}"
     
-    read -r -p "${C_BLUE}│${C_RST} 🔑 Target SSH Repo [${C_GREEN}$def_ssh${C_RST}]: " TARGET_REPO_SSH
-    TARGET_REPO_SSH="${TARGET_REPO_SSH:-$def_ssh}"
+    read -r -p "${C_BLUE}│${C_RST} 🔑 Target Repo     [${C_GREEN}$def_repo${C_RST}]: " TARGET_SHORT
+    TARGET_SHORT="${TARGET_SHORT:-$def_repo}"
+    TARGET_REPO_URL=$(build_repo_url "$TARGET_SHORT" "$PROTO_CHOICE")
     
     read -r -p "${C_BLUE}│${C_RST} 🌿 Remote Branch   [${C_GREEN}$def_branch${C_RST}]: " TARGET_REMOTE_BRANCH
     TARGET_REMOTE_BRANCH="${TARGET_REMOTE_BRANCH:-$def_branch}"
@@ -67,7 +84,7 @@ probe_push_config() {
     read -r -p "${C_BLUE}│${C_RST} 🔱 Upstream Base   [${C_GREEN}$def_base${C_RST}]: " UPSTREAM_BASE
     UPSTREAM_BASE="${UPSTREAM_BASE:-$def_base}"
 
-    REPO_NAME=$(basename "${TARGET_REPO_SSH}" .git)
+    REPO_NAME=$(basename "${TARGET_REPO_URL}" .git)
     REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/kernel-workspace/${REPO_NAME}"
     PUSH_REMOTE="origin"
     ui_end
@@ -76,19 +93,24 @@ probe_push_config() {
 mount_tunnel() {
     ui_header "CRYPTOGRAPHIC TUNNEL"
     
-    # Source the agent file created by the Sync script
-    # shellcheck source=/dev/null
-    [ -f "$AGENT_ENV" ] && source "$AGENT_ENV" >/dev/null 2>&1 || true
+    # Check if agent is already active with keys loaded
+    if ssh-add -l >/dev/null 2>&1; then
+        ui_ok "Agent is active and keys are loaded."
+    else
+        # Try to recover from env file
+        [ -f "$AGENT_ENV" ] && source "$AGENT_ENV" >/dev/null 2>&1 || true
 
-    # Spin it up if it does not exist
-    if [ -z "${SSH_AUTH_SOCK:-}" ] || ! kill -0 "${SSH_AGENT_PID:-}" 2>/dev/null; then
-        ui_step "Initializing background SSH daemon..."
-        eval "$(ssh-agent -s)" > /dev/null
-        echo "export SSH_AUTH_SOCK=\"${SSH_AUTH_SOCK}\"" > "$AGENT_ENV"
-        echo "export SSH_AGENT_PID=\"${SSH_AGENT_PID}\"" >> "$AGENT_ENV"
-        chmod 600 "$AGENT_ENV"
+        # Spin it up if it does not exist or is dead
+        if [ -z "${SSH_AUTH_SOCK:-}" ] || ! kill -0 "${SSH_AGENT_PID:-}" 2>/dev/null; then
+            ui_step "Initializing background SSH daemon..."
+            eval "$(ssh-agent -s)" > /dev/null
+            echo "export SSH_AUTH_SOCK=\"${SSH_AUTH_SOCK}\"" > "$AGENT_ENV"
+            echo "export SSH_AGENT_PID=\"${SSH_AGENT_PID}\"" >> "$AGENT_ENV"
+            chmod 600 "$AGENT_ENV"
+        fi
         
         if [ -f "$SSH_KEY_PATH" ]; then
+            ui_step "Mounting SSH key (Enter passphrase if prompted)..."
             ssh-add "$SSH_KEY_PATH" 2>/dev/null || true
         fi
     fi
@@ -97,11 +119,16 @@ mount_tunnel() {
     mkdir -p ~/.ssh/sockets
     export GIT_SSH_COMMAND="ssh -i ${SSH_KEY_PATH} -o IdentitiesOnly=yes -o ServerAliveInterval=60 -o ServerAliveCountMax=120 -o ControlMaster=auto -o ControlPath=~/.ssh/sockets/%%r@%%h-%%p -o ControlPersist=60m"
     
-    ui_step "Executing Handshake with GitHub..."
-    if ssh -i "$SSH_KEY_PATH" -T -o ConnectTimeout=5 git@github.com 2>&1 | grep -q "successfully authenticated"; then
-        ui_ok "Connection secured."
+    # Only test connection if SSH protocol was chosen
+    if [[ "$TARGET_REPO_URL" == *"git@github.com"* ]]; then
+        ui_step "Executing Handshake with GitHub..."
+        if ssh -i "$SSH_KEY_PATH" -T -o ConnectTimeout=5 git@github.com 2>&1 | grep -q "successfully authenticated"; then
+            ui_ok "Connection secured."
+        else
+            ui_warn "Handshake anomalous, but proceeding."
+        fi
     else
-        ui_warn "Handshake anomalous, but proceeding."
+        ui_ok "Using HTTPS. Skipping SSH handshake."
     fi
     ui_end
 }
@@ -129,7 +156,7 @@ apply_workspace_optimizations() {
     git config --local pack.packSizeLimit 1g
     git config --local pack.threads "$system_threads"
     
-    git remote set-url "$PUSH_REMOTE" "$TARGET_REPO_SSH" 2>/dev/null || git remote add "$PUSH_REMOTE" "$TARGET_REPO_SSH"
+    git remote set-url "$PUSH_REMOTE" "$TARGET_REPO_URL" 2>/dev/null || git remote add "$PUSH_REMOTE" "$TARGET_REPO_URL"
     ui_ok "Git memory management and remotes configured."
     ui_end
 }

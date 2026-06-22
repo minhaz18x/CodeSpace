@@ -10,7 +10,7 @@ IFS=$'\n\t'
 readonly SSH_KEY_PATH="${HOME}/.ssh/id_ed25519"
 readonly AGENT_ENV="${HOME}/.ssh/persistent_git_agent.env"
 
-# ANSI-C Quoted Colors (Ensures universal rendering on Termux, Mac, Linux)
+# ANSI-C Quoted Colors (Ensures universal rendering)
 readonly C_RED=$'\033[1;31m'
 readonly C_GREEN=$'\033[1;32m'
 readonly C_YELLOW=$'\033[1;33m'
@@ -61,6 +61,16 @@ run_with_retry() {
     ui_err "Command failed after $max_attempts attempts: $cmd"
 }
 
+build_repo_url() {
+    local repo_short=$1
+    local proto=$2
+    if [ "$proto" == "2" ]; then
+        echo "git@github.com:${repo_short}.git"
+    else
+        echo "https://github.com/${repo_short}.git"
+    fi
+}
+
 # ==============================================================================
 # WORKFLOW MODULES
 # ==============================================================================
@@ -69,48 +79,66 @@ mount_crypto_agent() {
     ui_header "SECURITY SUBSYSTEM"
     mkdir -p "${HOME}/.ssh" && chmod 700 "${HOME}/.ssh"
 
+    # Check if agent is already running and key is loaded
+    if ssh-add -l >/dev/null 2>&1; then
+        ui_ok "Agent is active and keys are loaded."
+        ui_end
+        return 0
+    fi
+
     # Source existing environment if available
     if [ -f "$AGENT_ENV" ]; then
         # shellcheck source=/dev/null
         source "$AGENT_ENV" >/dev/null 2>&1 || true
     fi
 
-    # Start SSH agent if not running
+    # If socket is dead or missing, start a new agent
     if [ -z "${SSH_AUTH_SOCK:-}" ] || ! kill -0 "${SSH_AGENT_PID:-}" 2>/dev/null; then
-        ui_step "Initializing background SSH daemon..."
+        ui_step "Initializing new background SSH daemon..."
         eval "$(ssh-agent -s)" > /dev/null
         echo "export SSH_AUTH_SOCK=\"${SSH_AUTH_SOCK}\"" > "$AGENT_ENV"
         echo "export SSH_AGENT_PID=\"${SSH_AGENT_PID}\"" >> "$AGENT_ENV"
         chmod 600 "$AGENT_ENV"
-        
-        if [ -f "$SSH_KEY_PATH" ]; then
-            ssh-add "$SSH_KEY_PATH" 2>/dev/null || true
-        fi
-        ui_ok "Agent initialized and securely mounted."
     else
-        ui_ok "Agent is already running."
+        ui_step "Reconnected to existing SSH daemon."
     fi
+    
+    # Add the key (prompts for password ONLY once per boot)
+    if [ -f "$SSH_KEY_PATH" ]; then
+        ui_step "Mounting SSH key (Enter passphrase if prompted)..."
+        ssh-add "$SSH_KEY_PATH" || ui_warn "Skipped key addition or failed."
+    fi
+    
+    ui_ok "Agent initialized and securely mounted."
     ui_end
 }
 
 probe_config_matrix() {
     ui_header "TARGET CONFIGURATION"
     
-    local def_t_repo="https://github.com/LineageOS/android_kernel_xiaomi_sm6250.git"
+    local def_t_repo="LineageOS/android_kernel_xiaomi_sm6250"
     local def_t_branch="lineage-22.2"
-    local def_u_repo="https://github.com/LineageOS/android_kernel_qcom_sm8150.git"
+    local def_u_repo="LineageOS/android_kernel_qcom_sm8150"
     local def_u_branch="lineage-20"
 
-    echo -e "${C_MAGENTA}│${C_RST} ${C_DIM}Press [ENTER] to use defaults.${C_RST}"
+    echo -e "${C_MAGENTA}│${C_RST} ${C_DIM}Select Protocol:${C_RST}"
+    echo -e "${C_MAGENTA}│${C_RST}  ${C_CYAN}[1]${C_RST} HTTPS"
+    echo -e "${C_MAGENTA}│${C_RST}  ${C_CYAN}[2]${C_RST} SSH"
+    read -r -p "${C_MAGENTA}│${C_RST} Choice [1/2]: " PROTO_CHOICE
+    PROTO_CHOICE="${PROTO_CHOICE:-1}"
+
+    echo -e "${C_MAGENTA}│${C_RST} ${C_DIM}Press [ENTER] to use defaults. Use 'User/Repo' format.${C_RST}"
     
-    read -r -p "${C_MAGENTA}│${C_RST} 📦 Target Repo   [${C_GREEN}$def_t_repo${C_RST}]: " TARGET_REPO
-    TARGET_REPO="${TARGET_REPO:-$def_t_repo}"
+    read -r -p "${C_MAGENTA}│${C_RST} 📦 Target Repo   [${C_GREEN}$def_t_repo${C_RST}]: " TARGET_SHORT
+    TARGET_SHORT="${TARGET_SHORT:-$def_t_repo}"
+    TARGET_REPO=$(build_repo_url "$TARGET_SHORT" "$PROTO_CHOICE")
     
     read -r -p "${C_MAGENTA}│${C_RST} 🌿 Target Branch [${C_GREEN}$def_t_branch${C_RST}]: " TARGET_BRANCH
     TARGET_BRANCH="${TARGET_BRANCH:-$def_t_branch}"
     
-    read -r -p "${C_MAGENTA}│${C_RST} 🌐 Upstream Repo [${C_GREEN}$def_u_repo${C_RST}]: " UPSTREAM_REPO
-    UPSTREAM_REPO="${UPSTREAM_REPO:-$def_u_repo}"
+    read -r -p "${C_MAGENTA}│${C_RST} 🌐 Upstream Repo [${C_GREEN}$def_u_repo${C_RST}]: " UPSTREAM_SHORT
+    UPSTREAM_SHORT="${UPSTREAM_SHORT:-$def_u_repo}"
+    UPSTREAM_REPO=$(build_repo_url "$UPSTREAM_SHORT" "$PROTO_CHOICE")
     
     read -r -p "${C_MAGENTA}│${C_RST} 🔱 Upstream Base [${C_GREEN}$def_u_branch${C_RST}]: " UPSTREAM_BRANCH
     UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-$def_u_branch}"
@@ -176,7 +204,7 @@ handle_conflict() {
             E)
                 echo -e "\n${C_GREEN}=== MANUAL RECOVERY CHEAT SHEET ===${C_RST}"
                 echo -e " 1. Type ${C_CYAN}git status${C_RST} to find 'both modified' files."
-                echo -e " 2. Open the files and fix conflicts (remove <<< === >>>)."
+                echo -e " 2. Open the files and fix conflicts."
                 echo -e " 3. Type ${C_CYAN}git add <file>${C_RST} for each fixed file."
                 echo -e " 4. Prevent SSH loops: ${C_MAGENTA}source $AGENT_ENV${C_RST}"
                 echo -e " 5. Resume sync: ${C_CYAN}git $op_type --continue${C_RST}"
